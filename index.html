@@ -4841,6 +4841,9 @@ function setupOrientation() {
   });
   $("#q-nesting").addEventListener("change", e => { STATE.orient.nesting = e.target.value; saveState(); });
   $("#q-adjust").addEventListener("change", e => { STATE.orient.adjust = e.target.value; saveState(); });
+  // v3.0 fix — these two were previously dead (selecting them did nothing). Now persisted.
+  if ($("#q-approach")) $("#q-approach").addEventListener("change", e => { STATE.orient.approach = e.target.value; saveState(); });
+  if ($("#q-missing"))  $("#q-missing").addEventListener("change",  e => { STATE.orient.missing  = e.target.value; saveState(); });
   $("#q-n").addEventListener("change", e => { STATE.orient.n = Number(e.target.value) || null; saveState(); });
   $("#q-model-form").addEventListener("change", e => {
     STATE.orient.modelForm = e.target.value;
@@ -5359,7 +5362,15 @@ function buildWebRDataset(lf) {
       nRows, nIds: ids.size, hasComp, covMeta, components,
       baselineLevel: lf.baselineLevel || "",
       groupRef: lf.groupReference || (STATE.orient && STATE.orient.refLevel) || "",
-      valueCol: lf.valueCol
+      valueCol: lf.valueCol,
+      // Step-3 choices the engine now honours (Q4 nesting, Q5 adjust, Q6 model form,
+      // Q7 approach, Q8 missing, Q9 transform):
+      modelForm: (STATE.orient && STATE.orient.modelForm) || "ancova_post",
+      transform: (STATE.orient && STATE.orient.transform) || "none",
+      nesting:   (STATE.orient && STATE.orient.nesting)   || "one_per_outcome",
+      adjust:    (STATE.orient && STATE.orient.adjust)    || "none",
+      approach:  (STATE.orient && STATE.orient.approach)  || "ancova",
+      missing:   (STATE.orient && STATE.orient.missing)   || "complete_case"
     }
   };
 }
@@ -5373,7 +5384,7 @@ function buildWebRScript(csvPath, meta) {
   const covVec = "c(" + meta.covMeta.map(c => rStr(c.rname)).join(",") + ")";
   const compVec = "c(" + (meta.components || []).map(rStr).join(",") + ")";
   const loop = meta.hasComp
-    ? `  comps <- ${compVec}\n  if (length(comps) == 0) comps <- sort(unique(as.character(d$comp)))\n  for (cc in comps) fit_one(d[as.character(d$comp) == cc, , drop=FALSE], cc)`
+    ? `  comps <- ${compVec}\n  if (length(comps) == 0) comps <- sort(unique(as.character(d$comp)))\n  if (nesting == "joint_components") { fit_joint(d) } else { for (cc in comps) fit_one(d[as.character(d$comp) == cc, , drop=FALSE], cc) }`
     : `  fit_one(d, ${rStr(meta.valueCol || "outcome")})`;
   return `
 out <- capture.output({
@@ -5389,56 +5400,140 @@ ${covCat}
 ${covNum}
   covNames <- ${covVec}
   baseLvl  <- ${rStr(meta.baselineLevel)}
+  mf       <- ${rStr(meta.modelForm)}   # Q6 model form: ancova_post | ancova_change | change_only | post_only
+  tf       <- ${rStr(meta.transform)}   # Q9 transform: none | log | log_offset | log10 | log10_offset | sqrt | inverse
+  nesting  <- ${rStr(meta.nesting)}     # Q4: one_per_outcome | joint_components
+  adjust   <- ${rStr(meta.adjust)}      # Q5: none | sidak | fdr | tukey
+  approach <- ${rStr(meta.approach)}    # Q7: ancova | anova | lmm | glmm | nonparam | robust | nonlinear
+  missingS <- ${rStr(meta.missing)}     # Q8: complete_case | per_protocol | itt_lmm | itt_mice | locf
+
+  emAdjust <- if (adjust == "fdr") "BH" else if (adjust %in% c("none","sidak","tukey","bonferroni","holm")) adjust else "none"
+
+  applyTf <- function(x){
+    if (tf == "log")            { if (any(x <= 0, na.rm=TRUE)) log(x + 1) else log(x) }
+    else if (tf == "log_offset")    log(x + 1)
+    else if (tf == "log10")     { if (any(x <= 0, na.rm=TRUE)) log10(x + 1) else log10(x) }
+    else if (tf == "log10_offset")  log10(x + 1)
+    else if (tf == "sqrt")          sqrt(pmax(x, 0))
+    else if (tf == "inverse")       1 / x
+    else x
+  }
+  tfLabel <- function(){
+    if (tf == "log") "log(value)" else if (tf == "log_offset") "log(value + 1)"
+    else if (tf == "log10") "log10(value)" else if (tf == "log10_offset") "log10(value + 1)"
+    else if (tf == "sqrt") "sqrt(value)" else if (tf == "inverse") "1/value" else "value"
+  }
+  approach_notice <- function(){
+    if (approach %in% c("glmm","nonparam","robust","nonlinear"))
+      cat("NOTE: analysis approach '", approach, "' is not fitted in-browser — the Gaussian ANCOVA/LMM below is shown instead. For ", approach, ", copy the Step 5 R code into RStudio.\\n", sep="")
+  }
+  missing_notice <- function(){
+    if (missingS %in% c("per_protocol","itt_mice","locf"))
+      cat("NOTE: missing-data strategy '", missingS, "' is not applied in-browser — this is a complete-case / available-case fit. Use the Step 5 code for ", missingS, ".\\n", sep="")
+  }
+
+  # Residual-normality diagnostic (Usman's real gate: the assumption is on residuals).
+  resid_qq <- function(m){
+    rr <- tryCatch(as.numeric(residuals(m)), error=function(e) numeric(0))
+    n <- length(rr); if (n < 3) return(NA_real_)
+    suppressWarnings(cor(sort(rr), qnorm(ppoints(n))))
+  }
+  skew1 <- function(x){ x <- x[is.finite(x)]; if (length(x) < 3) return(NA_real_); mu<-mean(x); s<-sd(x); if (s==0) return(0); mean((x-mu)^3)/s^3 }
+
+  # Shared: report a fitted model (coeffs + ANOVA + emmeans pairwise) + residual-QQ gate.
+  report_model <- function(m, byspec, respLab, tfEff, label, rawvals){
+    if (tfEff != "none") cat("(Contrasts are on the", respLab, "scale.)\\n")
+    cat("--- Coefficients ---\\n"); print(round(summary(m)$coefficients, 4))
+    cat("\\n--- ANOVA ---\\n"); print(tryCatch(anova(m), error=function(e) "anova unavailable"))
+    cat("\\n--- emmeans: between-group contrast", byspec$lab, "(adjust='", emAdjust, "') ---\\n", sep="")
+    em <- tryCatch(emmeans(m, as.formula(byspec$f)), error=function(e) NULL)
+    if (!is.null(em)) print(pairs(em, adjust=emAdjust)) else cat("emmeans unavailable\\n")
+    qq <- resid_qq(m); sk <- skew1(rawvals); mn <- suppressWarnings(min(rawvals, na.rm=TRUE))
+    cat("\\n--- Residual normality (Usman's gate — the assumption is on residuals, not the raw outcome) ---\\n")
+    if (is.na(qq)) cat("Residual Q-Q r: not available (too few residuals)\\n")
+    else cat("Residual Q-Q correlation r =", round(qq,3), if (qq < 0.97) " ← below 0.97; see the guided transform picker below" else " — OK (>= 0.97), no transform needed", "\\n")
+    # Machine-readable sentinel for the JS transform wizard: label | qq | min(raw) | skew(raw)
+    cat("##DIAG##|", label, "|", ifelse(is.na(qq),"NA",round(qq,4)), "|", ifelse(is.finite(mn),round(mn,4),"NA"), "|", ifelse(is.na(sk),"NA",round(sk,4)), "\\n", sep="")
+  }
 
   fit_one <- function(dd, label){
     cat("\\n==================================================\\n")
     cat("OUTCOME:", label, "\\n")
     cat("==================================================\\n")
+    approach_notice(); missing_notice()
     dd <- droplevels(dd)
     if (baseLvl != "" && baseLvl %in% as.character(dd$time)) {
       bl <- dd[as.character(dd$time) == baseLvl, c("id","value")]
-      names(bl)[2] <- "baseline"
-      bl <- bl[!duplicated(bl$id), ]
+      names(bl)[2] <- "baseline"; bl <- bl[!duplicated(bl$id), ]
       dd <- merge(dd, bl, by="id", all.x=TRUE)
       dm <- dd[as.character(dd$time) != baseLvl, , drop=FALSE]
-    } else {
-      dd$baseline <- NA_real_
-      dm <- dd
-    }
+    } else { dd$baseline <- NA_real_; dm <- dd }
     dm <- droplevels(dm)
-    if (nrow(dm) < 6 || length(unique(dm$id)) < 3) {
-      cat("Too few usable rows for a mixed model on this outcome; skipped.\\n"); return(invisible())
-    }
+    if (nrow(dm) < 6 || length(unique(dm$id)) < 3) { cat("Too few usable rows for this outcome; skipped.\\n"); return(invisible()) }
     hasBase   <- any(!is.na(dd$baseline))
     multiTime <- nlevels(dm$time) >= 2
-    repl      <- if (nrow(dm) > 0) max(table(dm$id)) else 0   # max observations per participant
-    useRE     <- repl >= 2                                    # random intercept only identifiable with within-id replication
-    rhsTerms  <- c(if (hasBase) "baseline", if (multiTime) "grp*time" else "grp", covNames)
-    form <- as.formula(paste("value ~", paste(rhsTerms, collapse=" + "), if (useRE) "+ (1|id)" else ""))
-    if (useRE) {
-      cat("Model: linear mixed model —", deparse(form, width.cutoff=200), "\\n\\n")
-      m <- tryCatch(lmer(form, data=dm),
-                    error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL })
+    useRE     <- (max(table(dm$id)) >= 2)
+    anovaApp  <- (approach == "anova")                    # ANOVA = explicitly no baseline adjustment
+    useChange   <- (mf %in% c("ancova_change","change_only")) && hasBase && !anovaApp
+    useBaseline <- (mf %in% c("ancova_post","ancova_change")) && hasBase && !anovaApp
+    tfEff <- tf
+    if (useChange) {
+      dm$resp <- dm$value - dm$baseline
+      if (tf != "none") { cat("(Transform '", tf, "' ignored on a change score.)\\n", sep=""); tfEff <- "none" }
     } else {
-      cat("Model: baseline-adjusted ANCOVA —", deparse(form, width.cutoff=200), "\\n")
-      cat("(One follow-up per participant for this outcome, so a random intercept is not identifiable;\\n")
-      cat(" OLS gives the same baseline-adjusted group contrast — Laird 1983.)\\n\\n")
-      m <- tryCatch(lm(form, data=dm),
-                    error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL })
+      dm$resp <- applyTf(dm$value)
+      if (useBaseline && tf != "none") dm$baseline <- applyTf(dm$baseline)
+    }
+    respLab <- if (useChange) "value - baseline (change)" else tfLabel()
+    rhsTerms <- c(if (useBaseline) "baseline", if (multiTime) "grp*time" else "grp", covNames)
+    form <- as.formula(paste("resp ~", paste(rhsTerms, collapse=" + "), if (useRE) "+ (1|id)" else ""))
+    cat("Model form:", mf, "| approach:", approach, "| transform:", tfEff, "| response:", respLab, "\\n")
+    if (useRE) {
+      cat("Fit: linear mixed model —", deparse(form, width.cutoff=200), "\\n\\n")
+      m <- tryCatch(lmer(form, data=dm), error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL })
+    } else {
+      cat("Fit: baseline-adjusted OLS — single follow-up, random intercept not identifiable; OLS gives the same group contrast (Laird 1983) —", deparse(form, width.cutoff=200), "\\n\\n")
+      m <- tryCatch(lm(form, data=dm), error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL })
     }
     if (is.null(m)) return(invisible())
-    cat("--- Coefficients ---\\n")
-    print(round(summary(m)$coefficients, 4))
-    cat("\\n--- ANOVA ---\\n")
-    print(tryCatch(anova(m), error=function(e) "anova unavailable"))
-    if (multiTime) {
-      cat("\\n--- emmeans: between-group contrast at each timepoint (adjust='none', Usman's lead) ---\\n")
-      em <- tryCatch(emmeans(m, ~ grp | time), error=function(e) NULL)
-    } else {
-      cat("\\n--- emmeans: between-group contrast (adjust='none') ---\\n")
-      em <- tryCatch(emmeans(m, ~ grp), error=function(e) NULL)
-    }
-    if (!is.null(em)) print(pairs(em, adjust="none")) else cat("emmeans unavailable\\n")
+    byspec <- if (multiTime) list(f="~ grp | time", lab="at each timepoint") else list(f="~ grp", lab="")
+    report_model(m, byspec, respLab, tfEff, label, dm$value)
+  }
+
+  # Q4 joint nesting: one model across all components, component as a factor (Usman's nested-scales pattern).
+  fit_joint <- function(dd){
+    cat("\\n==================================================\\n")
+    cat("JOINT MODEL over components:", paste(sort(unique(as.character(dd$comp))), collapse=", "), "\\n")
+    cat("==================================================\\n")
+    approach_notice(); missing_notice()
+    dd <- droplevels(dd)
+    if (baseLvl != "" && baseLvl %in% as.character(dd$time)) {
+      bl <- dd[as.character(dd$time) == baseLvl, c("id","comp","value")]
+      names(bl)[3] <- "baseline"; bl <- bl[!duplicated(bl[, c("id","comp")]), ]
+      dd <- merge(dd, bl, by=c("id","comp"), all.x=TRUE)
+      dm <- dd[as.character(dd$time) != baseLvl, , drop=FALSE]
+    } else { dd$baseline <- NA_real_; dm <- dd }
+    dm <- droplevels(dm); dm$comp <- factor(dm$comp)
+    if (nrow(dm) < 8) { cat("Too few rows for a joint model; skipped.\\n"); return(invisible()) }
+    hasBase   <- any(!is.na(dd$baseline))
+    multiTime <- nlevels(dm$time) >= 2
+    useRE     <- (max(table(dm$id)) >= 2)
+    anovaApp  <- (approach == "anova")
+    useChange   <- (mf %in% c("ancova_change","change_only")) && hasBase && !anovaApp
+    useBaseline <- (mf %in% c("ancova_post","ancova_change")) && hasBase && !anovaApp
+    tfEff <- tf
+    if (useChange) { dm$resp <- dm$value - dm$baseline; if (tf != "none") { cat("(Transform ignored on a change score.)\\n"); tfEff <- "none" } }
+    else { dm$resp <- applyTf(dm$value); if (useBaseline && tf != "none") dm$baseline <- applyTf(dm$baseline) }
+    respLab <- if (useChange) "value - baseline (change)" else tfLabel()
+    rhsTerms <- c(if (useBaseline) "baseline", if (multiTime) "grp*time" else "grp", "comp", covNames)
+    form <- as.formula(paste("resp ~", paste(rhsTerms, collapse=" + "), if (useRE) "+ (1|id)" else ""))
+    cat("Model form:", mf, "| approach:", approach, "| transform:", tfEff, "| nesting: joint (component as factor)\\n")
+    cat("Fit:", if (useRE) "mixed model" else "OLS", "—", deparse(form, width.cutoff=200), "\\n\\n")
+    m <- tryCatch(if (useRE) lmer(form, data=dm) else lm(form, data=dm),
+                  error=function(e){ cat("Joint model failed (", conditionMessage(e), ") — falling back to one model per outcome.\\n", sep=""); NULL })
+    if (is.null(m)) { for (cc in sort(unique(as.character(d$comp)))) fit_one(d[as.character(d$comp) == cc, , drop=FALSE], cc); return(invisible()) }
+    byspec <- if (multiTime) list(f="~ grp | comp * time", lab="by component & timepoint") else list(f="~ grp | comp", lab="by component")
+    report_model(m, byspec, respLab, tfEff, "JOINT", dm$value)
   }
 
 ${loop}
@@ -5488,6 +5583,9 @@ async function runWithWebR() {
     const text = await WebREngine.runScript(rcode, webRLog, { [WEBR_CSV_PATH]: csv });
     webRLog("✓ Done.");
     renderWebRResult(text, meta);
+    // Residual-QQ gate (Usman's real assumption): if any outcome's residual Q-Q r < 0.97,
+    // launch the guided transform / model-family picker.
+    maybeRenderTransformWizard(parseWebRDiag(text), meta);
   } catch (e) {
     const msg = (e && e.message) ? e.message : String(e);
     webRLog("✗ " + msg);
@@ -5507,12 +5605,117 @@ function renderWebRResult(text, meta) {
       `<div class="status" style="background:#ecfdf5;border-left:4px solid #16a34a;color:#064e3b;line-height:1.5;margin-bottom:10px">`
       + `<b>Fitted with real R in your browser</b> — lme4 + lmerTest + emmeans, ${meta.nRows} rows × ${meta.nIds} participants`
       + `${meta.hasComp ? " × " + meta.components.length + " outcome(s)" : ""}. `
-      + `Model: <code>value ~ baseline + grp*time + (1|id)</code> (Usman's baseline-anchored multi-timepoint LMM); between-group contrasts via <code>emmeans</code> at each timepoint with <code>adjust="none"</code>. Your data never left this machine.</div>`
+      + `Honouring your Step-3 choices — model form <code>${meta.modelForm || "ancova_post"}</code>, approach <code>${meta.approach || "ancova"}</code>, nesting <code>${meta.nesting || "one_per_outcome"}</code>, adjust <code>${meta.adjust || "none"}</code>${(meta.transform && meta.transform !== "none") ? `, transform <code>${meta.transform}</code>` : ""}. Between-group contrasts via <code>emmeans</code>; the exact form fitted per outcome is printed in each block below. Your data never left this machine.</div>`
       + `<pre style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;overflow-x:auto;white-space:pre">${escHtml(text)}</pre>`
       + `<p class="hint" style="margin-top:8px">This is the raw R output. The narrative report builder (Step 7) currently formats the two-timepoint JS path; for the mixed model, copy this output or the Step 5 R code.</p>`;
   }
   try { saveState(); } catch (e) {}
   if (step6) window.scrollTo({ top: step6.offsetTop - 20, behavior: "smooth" });
+}
+
+/* ============================================================================
+   v3.0 — Residual-QQ guided transform / model-family picker.
+   Triggered when a fitted outcome's RESIDUAL Q-Q correlation r < 0.97 (Usman's
+   real normality gate — the assumption is on residuals, not the raw outcome).
+   Walks his decision tree, pre-recommends from the data (min, skew, outcome
+   type), and offers one-click "Apply & re-run with real R".
+   ============================================================================ */
+function parseWebRDiag(text) {
+  const out = [];
+  const re = /##DIAG##\|\s*(.*?)\s*\|\s*(NA|-?\d+(?:\.\d+)?)\s*\|\s*(NA|-?\d+(?:\.\d+)?)\s*\|\s*(NA|-?\d+(?:\.\d+)?)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const num = s => (s === "NA" ? NaN : parseFloat(s));
+    out.push({ label: m[1], qq: num(m[2]), minval: num(m[3]), skew: num(m[4]) });
+  }
+  return out;
+}
+
+// Map a flagged outcome's data shape to Usman's decision-tree recommendation.
+function recommendFix(d) {
+  const t = STATE.outcomeType || "";
+  if (t === "binary") return { kind: "approach", value: "glmm", label: "Logistic GLMM (binary outcome)", real: false };
+  if (t === "count")  return { kind: "approach", value: "glmm", label: "Poisson / Neg-Bin GLMM (count outcome)", real: false };
+  const skewed   = isFinite(d.skew) && Math.abs(d.skew) > 0.5;
+  const rightSk  = isFinite(d.skew) && d.skew > 0.5;
+  const positive = isFinite(d.minval) && d.minval > 0;
+  const hasZero  = isFinite(d.minval) && d.minval === 0;
+  if (rightSk && positive) return { kind: "transform", value: "log",        label: "log(Y) — positive & right-skewed", real: true };
+  if (rightSk && hasZero)  return { kind: "transform", value: "log_offset", label: "log(Y + 1) — right-skewed with zeros", real: true };
+  if (skewed)              return { kind: "transform", value: "sqrt",       label: "√Y — skewed (not strictly positive)", real: true };
+  return { kind: "approach", value: "nonparam", label: "Rank-based / non-parametric (symmetric non-normality)", real: false };
+}
+
+const WIZ_OPTIONS = [
+  { kind: "transform", value: "none",         text: "Keep raw outcome (flag it in the report — Usman's flag-and-still-report)", real: true },
+  { kind: "transform", value: "log",          text: "log(Y) — positive, right-skewed", real: true },
+  { kind: "transform", value: "log_offset",   text: "log(Y + 1) — right-skewed with zeros", real: true },
+  { kind: "transform", value: "sqrt",         text: "√Y — milder; counts or symmetric skew", real: true },
+  { kind: "transform", value: "inverse",      text: "1/Y — strong correction (positives only)", real: true },
+  { kind: "approach",  value: "glmm",         text: "GLMM (Gamma / Poisson / Binomial) — needs Step-5 R code", real: false },
+  { kind: "approach",  value: "robust",       text: "Robust LMM (rlmer) — outlier-heavy; needs Step-5 R code", real: false },
+  { kind: "approach",  value: "nonparam",     text: "Non-parametric (rank-based) — needs Step-5 R code", real: false }
+];
+
+function maybeRenderTransformWizard(diag, meta) {
+  const old = $("#webr-transform-wizard"); if (old) old.remove();
+  const flagged = (diag || []).filter(d => isFinite(d.qq) && d.qq < 0.97);
+  const tgt = $("#results-target"); if (!tgt) return;
+  if (!flagged.length) {
+    const ok = document.createElement("div");
+    ok.id = "webr-transform-wizard";
+    ok.style.cssText = "margin-top:12px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:10px 12px;font-size:13px;color:#064e3b";
+    ok.innerHTML = `✓ <b>Residual normality is fine</b> for every outcome (all residual Q-Q r ≥ 0.97). No transform needed — this is the assumption that actually matters, and it's met.`;
+    tgt.appendChild(ok);
+    return;
+  }
+  const worst = flagged.slice().sort((a, b) => a.qq - b.qq)[0];
+  const rec = recommendFix(worst);
+  const rows = flagged.map(d => `<tr><td style="padding:3px 10px 3px 0">${d.label}</td><td style="padding:3px 10px;font-family:ui-monospace,monospace;color:#b91c1c">r = ${d.qq.toFixed(3)}</td><td style="padding:3px 0;color:#475569">skew ${isFinite(d.skew) ? d.skew.toFixed(2) : "—"}, min ${isFinite(d.minval) ? d.minval : "—"}</td></tr>`).join("");
+  const opts = WIZ_OPTIONS.map(o => {
+    const sel = (o.kind === rec.kind && o.value === rec.value) ? " selected" : "";
+    return `<option value="${o.kind}:${o.value}"${sel}>${o.text}</option>`;
+  }).join("");
+  const wiz = document.createElement("div");
+  wiz.id = "webr-transform-wizard";
+  wiz.style.cssText = "margin-top:14px;border:2px solid #2563eb;border-radius:10px;padding:14px 16px;background:#eff6ff";
+  wiz.innerHTML = `
+    <div style="font-weight:800;color:#1e3a8a;font-size:15px;margin-bottom:4px">⚠ Guided transform / model-family picker</div>
+    <p style="font-size:13px;color:#1e293b;margin:4px 0 10px">${flagged.length} outcome${flagged.length > 1 ? "s have" : " has"} a <b>residual</b> Q-Q correlation below 0.97 — the residuals (not the raw outcome) depart from normal. This is the assumption Usman actually checks, so it's worth addressing.</p>
+    <table style="font-size:12.5px;margin:0 0 10px;border-collapse:collapse"><tbody>${rows}</tbody></table>
+    <div style="background:#fff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 12px;font-size:13px">
+      <div style="margin-bottom:6px"><b>Recommended (from the worst outcome, r = ${worst.qq.toFixed(3)}):</b> ${rec.label}</div>
+      <div style="font-size:12px;color:#475569;margin-bottom:8px">Following Usman's tree: positive &amp; right-skewed → <code>log</code>; skewed but not strictly positive → <code>√Y</code>; counts/binary → GLMM; symmetric non-normality → rank-based. Override below if you know better.</div>
+      <label style="font-size:12px;font-weight:700;color:#1e3a8a;display:block;margin-bottom:3px">Fix to apply</label>
+      <select id="wiz-fix-select" style="width:100%;padding:7px 8px;font-size:13px;border:1px solid #93c5fd;border-radius:6px;background:#fff;margin-bottom:10px">${opts}</select>
+      <div id="wiz-fix-note" style="font-size:12px;color:#475569;margin-bottom:10px"></div>
+      <button id="wiz-apply-btn" class="btn gold" style="margin:0">▶ Apply &amp; re-run with real R</button>
+    </div>`;
+  tgt.appendChild(wiz);
+  const noteFor = key => {
+    const o = WIZ_OPTIONS.find(x => key === x.kind + ":" + x.value);
+    if (!o) return "";
+    return o.real
+      ? "✓ The engine will apply this and re-fit in real R, then re-check the residual Q-Q."
+      : "⚠ The in-browser engine fits Gaussian models, so it will record this choice and flag it — for the actual " + o.value.toUpperCase() + " fit, use the Step-5 R code. (A future engine update can run it here.)";
+  };
+  const noteEl = $("#wiz-fix-note"), selEl = $("#wiz-fix-select");
+  const updNote = () => { if (noteEl && selEl) noteEl.textContent = noteFor(selEl.value); };
+  if (selEl) selEl.addEventListener("change", updNote);
+  updNote();
+  const applyBtn = $("#wiz-apply-btn");
+  if (applyBtn) applyBtn.addEventListener("click", () => {
+    const [kind, value] = (selEl.value || "transform:none").split(":");
+    if (kind === "transform") {
+      STATE.orient.transform = value;
+      if ($("#q-transform")) $("#q-transform").value = value;
+    } else {
+      STATE.orient.approach = value;
+      if ($("#q-approach")) $("#q-approach").value = value;
+    }
+    try { saveState(); } catch (e) {}
+    runWithWebR();   // re-fit; the wizard re-evaluates the new residual Q-Q automatically
+  });
 }
 
 function runAnalysisInBrowser() {
