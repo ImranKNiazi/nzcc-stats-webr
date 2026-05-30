@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>webR proof-of-concept — real lme4 in the browser</title>
+<!-- Makes the page cross-origin isolated on plain static hosts (e.g. GitHub Pages),
+     so webR's fast SharedArrayBuffer channel works with no server config / no terminal. -->
+<script src="coi-serviceworker.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+         max-width: 880px; margin: 0 auto; padding: 24px; color: #0f172a; line-height: 1.5; }
+  h1 { font-size: 22px; border-bottom: 3px solid #0072B5; padding-bottom: 8px; }
+  h2 { font-size: 16px; color: #0072B5; margin-top: 22px; }
+  .sub { color: #475569; font-size: 13.5px; }
+  button { background: #16a34a; color: #fff; border: none; padding: 10px 18px; font-size: 14px;
+           font-weight: 700; border-radius: 8px; cursor: pointer; }
+  button:disabled { background: #94a3b8; cursor: not-allowed; }
+  .card { border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px 16px; margin: 14px 0; background: #fff; }
+  .status { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; background: #0f172a;
+            color: #e2e8f0; padding: 12px; border-radius: 8px; height: 190px; overflow-y: auto; white-space: pre-wrap; }
+  .status .ok { color: #4ade80; } .status .warn { color: #fbbf24; } .status .err { color: #f87171; }
+  pre.out { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px;
+            font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; overflow-x: auto; white-space: pre; }
+  .pill { display:inline-block; font-size: 11px; font-weight: 700; padding: 2px 9px; border-radius: 12px; }
+  .pill.green { background:#dcfce7; color:#14532d; } .pill.amber { background:#fef3c7; color:#7c2d12; }
+  code { background:#f1f5f9; padding:1px 5px; border-radius:4px; font-size:.92em; }
+  .note { background:#ecfdf5; border-left:4px solid #16a34a; padding:8px 12px; font-size:13px; margin:12px 0; }
+  .warnbox { background:#fff7ed; border-left:4px solid #d97706; padding:8px 12px; font-size:13px; margin:12px 0; }
+</style></head><body>
+
+<h1>webR proof-of-concept</h1>
+<p class="sub">Runs <b>real R</b> (lme4 + emmeans) entirely in your browser — no R install, no server, and your data never leaves this machine. This proves the engine path for the NZCC Stats App's multi-timepoint designs.</p>
+
+<div class="warnbox"><b>How to run this file:</b> webR needs the page to be <i>served with cross-origin-isolation headers</i> — a plain <code>file://</code> open or <code>python -m http.server</code> will fail with a URL error. Use the included <b><code>serve.py</code></b> (same folder), which sends those headers:
+<ol style="margin:6px 0 0">
+<li>Open a terminal in this folder.</li>
+<li>Run <code>python3 serve.py</code></li>
+<li>Open <code>http://localhost:8000/webR-POC-multitimepoint.html</code></li>
+</ol>
+First run downloads webR + lme4 (tens of MB, a minute or two); cached afterwards. Best in Chrome or Edge.</div>
+
+<div class="card">
+  <b>What it will do</b>
+  <ol style="margin:6px 0 0">
+    <li>Boot webR (R 4.6) in the browser.</li>
+    <li><code>install.packages(c("lme4","emmeans"))</code> from the WebAssembly repo.</li>
+    <li>Build a multi-timepoint sample (20 participants × 3 visits × 2 arms — the design the current in-browser engine refuses).</li>
+    <li>Fit Usman's mixed model <code>lmer(value ~ baseline + group*time + (1|id))</code> and report <code>emmeans</code> pairwise Group contrasts at each visit.</li>
+  </ol>
+</div>
+
+<button id="run">▶ Run the proof-of-concept</button>
+<span id="phase" class="pill amber" style="margin-left:10px;display:none"></span>
+
+<h2>Status <span class="sub">(live log)</span></h2>
+<div class="status" id="log">Idle. Click "Run" to begin.</div>
+
+<h2>Model output</h2>
+<pre class="out" id="out">— results will appear here —</pre>
+
+<div class="note" id="timing" style="display:none"></div>
+
+<script type="module">
+const logEl = document.getElementById('log');
+const outEl = document.getElementById('out');
+const phaseEl = document.getElementById('phase');
+const btn = document.getElementById('run');
+const timingEl = document.getElementById('timing');
+function log(msg, cls){ const s=document.createElement('span'); if(cls) s.className=cls; s.textContent=msg+"\n"; logEl.appendChild(s); logEl.scrollTop=logEl.scrollHeight; }
+function phase(t){ phaseEl.style.display='inline-block'; phaseEl.textContent=t; }
+
+btn.addEventListener('click', async () => {
+  btn.disabled = true; logEl.textContent=''; outEl.textContent='— running —';
+  const T0 = performance.now();
+  try {
+    phase('loading webR…'); log('Importing webR module from CDN…');
+    if (location.protocol === 'file:') {
+      throw new Error('Opened as a file:// — webR needs a served page. Start serve.py (see the orange box) and open the http://localhost address instead.');
+    }
+    const { WebR, ChannelType } = await import('https://webr.r-wasm.org/latest/webr.mjs');
+    // Pin baseUrl (fixes "null is not a valid URL"). Use the fast SharedArrayBuffer
+    // channel when the page is cross-origin isolated (serve.py), else fall back to the
+    // PostMessage channel so ANY static server works — just a little slower.
+    const opts = { baseUrl: 'https://webr.r-wasm.org/latest/' };
+    if (self.crossOriginIsolated) {
+      log('✓ Cross-origin isolated — using the fast SharedArrayBuffer channel.', 'ok');
+    } else {
+      opts.channelType = ChannelType.PostMessage;
+      log('Page not cross-origin isolated — using webR’s PostMessage channel (works on any server, a bit slower).', 'warn');
+    }
+    const webR = new WebR(opts);
+    await webR.init();
+    log('✓ webR booted — ' + (await (await webR.evalR('R.version.string')).toJs()).values[0], 'ok');
+
+    phase('installing lme4 + emmeans…');
+    log('Installing lme4 (+ Rcpp, RcppEigen, minqa, nloptr) and emmeans — this is the big first-time download…', 'warn');
+    const tI = performance.now();
+    await webR.installPackages(['lme4','emmeans'], { quiet: false });
+    log('✓ packages installed in ' + ((performance.now()-tI)/1000).toFixed(1) + 's', 'ok');
+
+    phase('fitting model…'); log('Building multi-timepoint sample and fitting lmer()…');
+    const rcode = `
+      out <- capture.output({
+        suppressMessages({ library(lme4); library(emmeans) })
+        set.seed(42)
+        n  <- 20
+        id <- factor(rep(1:n, each=3))
+        grp<- factor(rep(c("Chiro","Control"), each=3*n/2), levels=c("Control","Chiro"))
+        tm <- factor(rep(c("Base","Wk4","Wk8"), times=n), levels=c("Base","Wk4","Wk8"))
+        base_subj <- rep(rnorm(n, 16, 3), each=3)
+        eff <- ifelse(grp=="Chiro", c(0,-2.0,-3.2), c(0,-0.5,-0.8))[as.integer(tm)]
+        y  <- base_subj + eff + rnorm(3*n, 0, 1.4)
+        d  <- data.frame(id, group=grp, time=tm, value=y)
+        # baseline as a per-subject covariate (Usman's baseline-anchored multi-tp form)
+        d$baseline <- ave(ifelse(d$time=="Base", d$value, NA), d$id,
+                          FUN=function(z) z[!is.na(z)][1])
+        dm <- subset(d, time != "Base"); dm$time <- droplevels(dm$time)
+        m  <- lmer(value ~ baseline + group*time + (1|id), data=dm)
+        cat("=== Fixed effects (lmer) ===\\n")
+        print(round(summary(m)$coefficients, 4))
+        cat("\\n=== ANOVA (lme4, sequential) ===\\n")
+        print(anova(m))
+        cat("\\n=== emmeans: between-group contrast at each visit (adjust='none', Usman's lead) ===\\n")
+        em <- suppressMessages(emmeans(m, ~ group | time))
+        print(pairs(em, adjust="none"))
+      })
+      paste(out, collapse="\\n")
+    `;
+    const result = await webR.evalRString(rcode);
+    outEl.textContent = result;
+    log('✓ model fitted and contrasts computed.', 'ok');
+    phase('done'); phaseEl.className='pill green';
+    const secs = ((performance.now()-T0)/1000).toFixed(1);
+    timingEl.style.display='block';
+    timingEl.innerHTML = '✓ <b>Proof complete.</b> Real lme4 + emmeans ran in your browser in ' + secs + 's total (most of it the one-time package download). On a repeat run the packages are cached and it is far faster. This is the exact engine the app would call for multi-timepoint designs.';
+    await webR.close();
+  } catch (e) {
+    log('✗ ERROR: ' + (e && e.message ? e.message : e), 'err');
+    log('If this is a SharedArrayBuffer / cross-origin error, serve the file over http (see the orange box) rather than file://.', 'warn');
+    outEl.textContent = 'Failed — see status log.';
+    phase('error'); phaseEl.className='pill amber';
+  } finally { btn.disabled = false; }
+});
+</script>
+</body></html>
