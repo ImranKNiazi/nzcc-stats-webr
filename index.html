@@ -2459,10 +2459,12 @@ function renderOutcomeConfirmation() {
   const seen = new Set();
   const rows = [];
   outcomes.forEach(o => {
-    const stem = o.name.replace(/ \((Pre|Post|Baseline|Follow-up)\)$/i, "");
+    // One row per OUTCOME (subscale) — primary/secondary is a property of the subscale, not the
+    // timepoint. Long-format split outcomes carry o.stem (the Component); wide pairs use the name.
+    const stem = o.stem || o.name.replace(/ \((Pre|Post|Baseline|Follow-up)\)$/i, "");
     if (seen.has(stem)) return;
     seen.add(stem);
-    rows.push({ stem, cols: outcomes.filter(o2 => o2.name.startsWith(stem)).map(o2 => o2.col) });
+    rows.push({ stem, cols: o.stem ? [o.col] : outcomes.filter(o2 => o2.name.startsWith(stem)).map(o2 => o2.col) });
   });
 
   // Drop stale entries (e.g. from a previous file or pre-reshape outcome stems)
@@ -2495,8 +2497,8 @@ function renderOutcomeConfirmation() {
   let preamble = "";
   if (componentCol) {
     preamble = `<div style="background:#eff6ff;border-left:4px solid #1e3a8a;padding:8px 12px;border-radius:4px;font-size:12.5px;margin-bottom:10px;line-height:1.5">
-      <b>About the <code>${componentCol}</code> column:</b> the app read this as a <i>subscale / category</i> column — each value (anxiety, depression, stress, total, etc.) became one separate outcome after the reshape.
-      <br><br>You now decide which of these outcomes is the <b>primary</b> result (the headline of the report) and which are <b>secondary</b> (supporting). If you didn't mean this column to be treated as subscales, go back to Step 2's reshape panel and set "Subscale / category column" to "none".
+      <b>Same setting as the guided Step 7.</b> If you used the <b>Guided</b> Step 2 flow you already tagged these there — this table is the <i>same</i> primary/secondary choice, shown again for confirmation. Change it in either place; they stay in sync. (For wide-format files with no guided flow, this is the only place to tag.)
+      <br><br><b>About the <code>${componentCol}</code> column:</b> the app read it as a <i>subscale</i> column, so each value (${(STATE.colDistinct[componentCol]||[]).slice(0,4).join(", ")}${(STATE.colDistinct[componentCol]||[]).length>4?", …":""}) is one outcome. If you didn't mean this, go back to Step 2's reshape panel and set "Subscale / category column" to "none".
     </div>`;
   }
 
