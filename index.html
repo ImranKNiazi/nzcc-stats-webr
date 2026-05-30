@@ -2638,16 +2638,47 @@ function detectOutcomesForDescriptives() {
       { name: p.name + " (Post)", col: p.post, isOutcome: true }
     ]);
   }
-  // 2. Long form — single Value column, group by Time
+  // 2. Long form — split the single Value column per subscale (Component) × timepoint,
+  //    so each primary/secondary outcome gets its OWN descriptives + Q-Q (not one pooled pile
+  //    mixing four scales and three visits — which is what produced the misleading r=0.933).
   const valueCol = STATE.columns.find(c => STATE.colTypes[c] === "numeric"
                                           && (STATE.colRoles[c] === "Outcome" || /^(value|score|result|outcome)$/i.test(c)));
   if (valueCol) {
+    const lf = STATE.longFormat || {};
+    const compCol = lf.componentCol || STATE.columns.find(c => /^(component|scale|subscale|domain|biomarker)$/i.test(c) && STATE.colTypes[c] !== "numeric") || null;
+    const timeCol = lf.timeCol || colByRole("Time") || STATE.columns.find(c => /^(time|timepoint|visit|session|week|wk|month)/i.test(c)) || null;
+    const comps = compCol ? ((lf.includedComponents && lf.includedComponents.length) ? lf.includedComponents.slice() : (STATE.colDistinct[compCol] || [])) : [null];
+    const times = timeCol ? ((lf.includedTimes && lf.includedTimes.length) ? lf.includedTimes.slice() : (STATE.colDistinct[timeCol] || [])) : [null];
+    const out = [];
+    comps.forEach(cmp => {
+      if (cmp != null && STATE.outcomeRoles && STATE.outcomeRoles[cmp] === "excluded") return;
+      times.forEach(tm => {
+        const nm = [(cmp != null ? cmp : valueCol), (tm != null ? "@ " + tm : "")].join(" ").trim();
+        out.push({
+          name: nm, col: valueCol, isOutcome: true, long: true,
+          stem: (cmp != null ? cmp : valueCol),
+          filter: { compCol: (cmp != null ? compCol : null), comp: cmp, timeCol: (tm != null ? timeCol : null), time: tm }
+        });
+      });
+    });
+    if (out.length) return out;
     return [{ name: valueCol, col: valueCol, isOutcome: true, long: true }];
   }
   // 3. All numeric columns flagged as Outcome
   return STATE.columns
     .filter(c => STATE.colRoles[c] === "Outcome" && STATE.colTypes[c] === "numeric")
     .map(c => ({ name: c, col: c, isOutcome: true }));
+}
+
+// Rows backing one descriptive outcome — honours a per-subscale × timepoint filter so
+// long-format outcomes are described separately, not pooled across scales/visits.
+function outcomeRows(o) {
+  if (!o || !o.filter) return STATE.rows;
+  const f = o.filter;
+  return STATE.rows.filter(r =>
+    (f.compCol ? String(r[f.compCol]) === String(f.comp) : true) &&
+    (f.timeCol ? String(r[f.timeCol]) === String(f.time) : true)
+  );
 }
 
 function renderDescriptives() {
@@ -2678,7 +2709,7 @@ function renderDescriptives() {
   let nMissingAny = 0;
 
   outcomes.forEach(o => {
-    const vals = STATE.rows.map(r => r[o.col]);
+    const vals = outcomeRows(o).map(r => r[o.col]);
     const d = describeNumeric(vals);
     const verdict = normalityVerdict(d.qqR, d.n);
     if (d.qqR < 0.97) nonNormalCount++;
@@ -2742,7 +2773,7 @@ function renderDescriptives() {
       </tr></thead><tbody>`;
     outcomes.forEach(o => {
       groupLevels.forEach((g, gi) => {
-        const vals = STATE.rows.filter(r => r[groupCol] === g).map(r => r[o.col]);
+        const vals = outcomeRows(o).filter(r => r[groupCol] === g).map(r => r[o.col]);
         const d = describeNumeric(vals);
         html += `<tr>
           <td>${gi === 0 ? `<b>${o.name}</b>` : ""}</td>
@@ -2758,13 +2789,13 @@ function renderDescriptives() {
   }
 
   // ---- Missing-data summary ----
-  const totalCells = STATE.rows.length * outcomes.length;
+  const totalCells = outcomes.reduce((a, o) => a + outcomeRows(o).length, 0);
   const missPct = totalCells ? (nMissingAny / totalCells * 100).toFixed(1) : "0";
   // Per-participant missingness
   const idColForMiss = idCol || STATE.columns[0];
   const idsWithAnyMissing = new Set();
   outcomes.forEach(o => {
-    STATE.rows.forEach(r => {
+    outcomeRows(o).forEach(r => {
       const v = r[o.col];
       if (v === "" || v === null || v === undefined || isNaN(Number(v))) idsWithAnyMissing.add(r[idColForMiss]);
     });
@@ -2855,19 +2886,28 @@ function renderDescriptivePlots(outcomes) {
   Object.values(DESC_CHARTS).forEach(c => { try { c.destroy(); } catch (e) {} });
   DESC_CHARTS = {};
 
-  // Build the unique stems list
+  // Build the plot list. Long-format split outcomes (per subscale × timepoint) each carry a
+  // .filter, so render one block per outcome; otherwise collapse wide Pre/Post pairs to one stem.
+  const filteredMode = outcomes.length > 0 && outcomes.every(o => o.filter);
   const stems = [];
-  const seen = new Set();
-  outcomes.forEach(o => {
-    const stem = o.name.replace(/ \((Pre|Post|Baseline|Follow-up)\)$/i, "");
-    if (seen.has(stem)) return;
-    seen.add(stem);
-    const postOutcome = outcomes.find(o2 => o2.name === stem + " (Post)") ||
-                        outcomes.find(o2 => o2.name === stem + " (Follow-up)") ||
-                        outcomes.find(o2 => o2.name === stem) ||
-                        o;
-    stems.push({ stem, col: postOutcome.col });
-  });
+  if (filteredMode) {
+    outcomes.forEach(o => {
+      if (o.stem && STATE.outcomeRoles && STATE.outcomeRoles[o.stem] === "excluded") return;
+      stems.push({ stem: o.name, col: o.col, o, roleKey: o.stem || o.name });
+    });
+  } else {
+    const seen = new Set();
+    outcomes.forEach(o => {
+      const stem = o.name.replace(/ \((Pre|Post|Baseline|Follow-up)\)$/i, "");
+      if (seen.has(stem)) return;
+      seen.add(stem);
+      const postOutcome = outcomes.find(o2 => o2.name === stem + " (Post)") ||
+                          outcomes.find(o2 => o2.name === stem + " (Follow-up)") ||
+                          outcomes.find(o2 => o2.name === stem) ||
+                          o;
+      stems.push({ stem, col: postOutcome.col, roleKey: stem });
+    });
+  }
   console.log("[NZCC Stats App] descriptive plots — outcomes:", outcomes.length, "unique stems:", stems.length);
 
   if (!stems.length) {
@@ -2884,16 +2924,17 @@ function renderDescriptivePlots(outcomes) {
   let html = "";
   let toRender = [];
   stems.forEach((s, idx) => {
-    const role = STATE.outcomeRoles[s.stem] || (idx === 0 ? "primary" : "secondary");
+    const role = STATE.outcomeRoles[s.roleKey] || (idx === 0 ? "primary" : "secondary");
     if (role === "excluded") return;
     const badge = role === "primary"
       ? '<span class="pri-badge">PRIMARY</span>'
       : '<span class="sec-badge">SECONDARY</span>';
     const safeId = s.stem.replace(/[^a-zA-Z0-9_]/g, "_");
 
-    // Compute normality stats on the column we're about to plot
-    const vals = STATE.rows.map(r => parseFloat(r[s.col])).filter(v => !isNaN(v));
-    const d = describeNumeric(STATE.rows.map(r => r[s.col]));
+    // Compute normality stats on the rows backing this outcome (filtered per subscale × timepoint).
+    const srows = s.o ? outcomeRows(s.o) : STATE.rows;
+    const vals = srows.map(r => parseFloat(r[s.col])).filter(v => !isNaN(v));
+    const d = describeNumeric(srows.map(r => r[s.col]));
     const verdict = normalityVerdict(d.qqR, d.n);
     const qqPill = `<span class="normality-pill ${verdict.tag}" style="margin-left:8px">${verdict.text}</span>`;
     const transformHint = d.qqR < 0.97
@@ -2924,7 +2965,8 @@ function renderDescriptivePlots(outcomes) {
 
   // Render plots one by one with per-plot try/catch so one failure doesn't kill the row
   toRender.forEach(s => {
-    const vals = STATE.rows.map(r => parseFloat(r[s.col])).filter(v => !isNaN(v));
+    const srows = s.o ? outcomeRows(s.o) : STATE.rows;
+    const vals = srows.map(r => parseFloat(r[s.col])).filter(v => !isNaN(v));
     if (vals.length < 3) {
       const row = $(`#desc-row-${s.safeId}`);
       if (row) row.innerHTML += `<div style="grid-column:1/-1;font-size:11.5px;color:#94a3b8;padding:10px">Too few non-missing values (${vals.length}) to draw plots.</div>`;
@@ -2935,7 +2977,7 @@ function renderDescriptivePlots(outcomes) {
     try { drawQQPlot($(`#desc-qq-${s.safeId}`), vals, s.stem, palette[1]); }
     catch (e) { console.error("QQ failed for", s.stem, e); }
     if (groupCol && groupLevels.length) {
-      try { drawByGroupStrip($(`#desc-strip-${s.safeId}`), s.col, s.stem, groupCol, groupLevels, palette); }
+      try { drawByGroupStrip($(`#desc-strip-${s.safeId}`), s.col, s.stem, groupCol, groupLevels, palette, srows); }
       catch (e) { console.error("strip failed for", s.stem, e); }
     } else {
       const stripParent = $(`#desc-strip-${s.safeId}`) && $(`#desc-strip-${s.safeId}`).parentElement;
@@ -2952,18 +2994,26 @@ function renderDescriptivePlotsSVG(outcomes) {
   const tgt = $("#desc-plots-target");
   if (!tgt) return;
 
-  // Reuse the same stem grouping logic as the Chart.js path
+  // Same split as the Chart.js path: long-format outcomes carry a per-subscale × timepoint filter.
+  const filteredMode = outcomes.length > 0 && outcomes.every(o => o.filter);
   const stems = [];
-  const seen = new Set();
-  outcomes.forEach(o => {
-    const stem = o.name.replace(/ \((Pre|Post|Baseline|Follow-up)\)$/i, "");
-    if (seen.has(stem)) return;
-    seen.add(stem);
-    const postOutcome = outcomes.find(o2 => o2.name === stem + " (Post)") ||
-                        outcomes.find(o2 => o2.name === stem + " (Follow-up)") ||
-                        outcomes.find(o2 => o2.name === stem);
-    if (postOutcome) stems.push({ stem, outcome: postOutcome });
-  });
+  if (filteredMode) {
+    outcomes.forEach(o => {
+      if (o.stem && STATE.outcomeRoles && STATE.outcomeRoles[o.stem] === "excluded") return;
+      stems.push({ stem: o.name, outcome: o });
+    });
+  } else {
+    const seen = new Set();
+    outcomes.forEach(o => {
+      const stem = o.name.replace(/ \((Pre|Post|Baseline|Follow-up)\)$/i, "");
+      if (seen.has(stem)) return;
+      seen.add(stem);
+      const postOutcome = outcomes.find(o2 => o2.name === stem + " (Post)") ||
+                          outcomes.find(o2 => o2.name === stem + " (Follow-up)") ||
+                          outcomes.find(o2 => o2.name === stem);
+      if (postOutcome) stems.push({ stem, outcome: postOutcome });
+    });
+  }
 
   const groupCol = colByRole("Group");
   const groupLevels = groupCol ? (STATE.colDistinct[groupCol] || []) : [];
@@ -2973,12 +3023,13 @@ function renderDescriptivePlotsSVG(outcomes) {
   const banner = `<div style="background:#fff7ed;border-left:4px solid #fb923c;padding:8px 12px;margin-bottom:10px;border-radius:4px;font-size:12.5px;color:#7c2d12;line-height:1.5"><b>📊 SVG fallback active</b> — Chart.js couldn't load from any CDN, so plots are rendered with inline SVG. Functionality is identical; visual polish is slightly reduced.</div>`;
 
   tgt.innerHTML = banner + stems.map(({ stem, outcome }) => {
-    const vals = STATE.rows.map(r => parseFloat(r[outcome.col])).filter(v => !isNaN(v));
+    const srows = outcomeRows(outcome);
+    const vals = srows.map(r => parseFloat(r[outcome.col])).filter(v => !isNaN(v));
     if (!vals.length) return `<div style="font-size:12px;color:#94a3b8">No values for ${stem}</div>`;
     const histSvg  = svgHistogram(vals, stem, palette[0]);
     const qqSvg    = svgQQ(vals, palette[1]);
     const stripSvg = groupCol
-      ? svgStrip(STATE.rows, outcome.col, groupCol, groupLevels, palette)
+      ? svgStrip(srows, outcome.col, groupCol, groupLevels, palette)
       : `<div style="font-size:11.5px;color:#94a3b8;padding:30px 10px;text-align:center">No Group column — by-group plot omitted.</div>`;
     return `
       <div style="margin-bottom:14px;padding:10px;background:#fff;border:1px solid #e2e8f0;border-radius:6px">
@@ -3191,10 +3242,11 @@ function drawQQPlot(canvas, vals, label, color) {
   });
 }
 
-function drawByGroupStrip(canvas, col, label, groupCol, groupLevels, palette) {
+function drawByGroupStrip(canvas, col, label, groupCol, groupLevels, palette, rows) {
   if (!canvas) return;
+  const srcRows = rows || STATE.rows;
   const datasets = groupLevels.map((g, gi) => {
-    const vals = STATE.rows.filter(r => r[groupCol] === g)
+    const vals = srcRows.filter(r => r[groupCol] === g)
                             .map(r => parseFloat(r[col]))
                             .filter(v => !isNaN(v));
     return {
@@ -5308,11 +5360,21 @@ const WebREngine = (() => {
     onLog && onLog("✓ packages ready in " + ((performance.now() - t0) / 1000).toFixed(1) + "s.");
   }
 
+  // Best-effort install of extra packages only when a design needs them (e.g. robustlmm
+  // for robust LMM). Never fails the run if the WASM build is missing.
+  async function ensureExtra(webR, pkgs, onLog) {
+    for (const p of (pkgs || [])) {
+      try { onLog && onLog("Installing " + p + " (needed for your chosen approach)…"); await webR.installPackages([p], { quiet: true }); onLog && onLog("✓ " + p + " installed."); }
+      catch (e) { onLog && onLog("(" + p + " unavailable in this session — will fall back; see the note in the output.)"); }
+    }
+  }
+
   // Run an R script that returns ONE character string (capture.output(...) pattern).
   // files: optional { path: stringOrBytes } written to webR's FS before the run.
-  async function runScript(rcode, onLog, files) {
+  async function runScript(rcode, onLog, files, extraPkgs) {
     const webR = await boot(onLog);
     await ensurePkgs(webR, onLog);
+    await ensureExtra(webR, extraPkgs, onLog);
     if (files) {
       for (const [path, content] of Object.entries(files)) {
         const bytes = (typeof content === "string") ? new TextEncoder().encode(content) : content;
@@ -5370,7 +5432,8 @@ function buildWebRDataset(lf) {
       nesting:   (STATE.orient && STATE.orient.nesting)   || "one_per_outcome",
       adjust:    (STATE.orient && STATE.orient.adjust)    || "none",
       approach:  (STATE.orient && STATE.orient.approach)  || "ancova",
-      missing:   (STATE.orient && STATE.orient.missing)   || "complete_case"
+      missing:   (STATE.orient && STATE.orient.missing)   || "complete_case",
+      outcomeType: STATE.outcomeType || ""   // continuous|count|binary|ordinal|nominal (drives GLMM family)
     }
   };
 }
@@ -5406,6 +5469,8 @@ ${covNum}
   adjust   <- ${rStr(meta.adjust)}      # Q5: none | sidak | fdr | tukey
   approach <- ${rStr(meta.approach)}    # Q7: ancova | anova | lmm | glmm | nonparam | robust | nonlinear
   missingS <- ${rStr(meta.missing)}     # Q8: complete_case | per_protocol | itt_lmm | itt_mice | locf
+  otype    <- ${rStr(meta.outcomeType)} # outcome measurement type → GLMM family (continuous|count|binary|...)
+  nonGauss <- approach %in% c("glmm","nonparam","robust")   # families/ranks handle distribution → skip tf
 
   emAdjust <- if (adjust == "fdr") "BH" else if (adjust %in% c("none","sidak","tukey","bonferroni","holm")) adjust else "none"
 
@@ -5424,8 +5489,50 @@ ${covNum}
     else if (tf == "sqrt") "sqrt(value)" else if (tf == "inverse") "1/value" else "value"
   }
   approach_notice <- function(){
-    if (approach %in% c("glmm","nonparam","robust","nonlinear"))
-      cat("NOTE: analysis approach '", approach, "' is not fitted in-browser — the Gaussian ANCOVA/LMM below is shown instead. For ", approach, ", copy the Step 5 R code into RStudio.\\n", sep="")
+    if (approach == "nonlinear")
+      cat("NOTE: a non-linear mixed model is not fitted in-browser — the Gaussian fit below is shown instead. For dose-response/curve models, use the Step 5 R code.\\n", sep="")
+  }
+
+  # Choose a GLM(M) family for approach='glmm' from the outcome measurement type.
+  glmm_family <- function(yv){
+    if (otype == "binary")  return(binomial())
+    if (otype == "count")   return(poisson())
+    if (all(yv > 0, na.rm=TRUE)) return(Gamma(link="log"))   # positive, skewed continuous
+    return(NULL)   # can't pick a safe family (e.g. continuous with zeros/negatives)
+  }
+
+  # Shared fitter — applies the Q7 approach (Gaussian | GLMM | non-parametric rank-ANCOVA |
+  # robust LMM), with graceful fallback + an honest method line. Returns the fitted model (or NULL).
+  fit_engine <- function(form, dat, useRE){
+    if (approach == "nonparam") {
+      dat$resp <- rank(dat$resp)   # Conover rank-ANCOVA: rank-transform the response, keep the same design
+      cat("Method: non-parametric rank-ANCOVA (response rank-transformed; contrasts are on ranks).\\n")
+      return(tryCatch(if (useRE) lmer(form, data=dat) else lm(form, data=dat),
+                      error=function(e){ cat("Rank model failed:", conditionMessage(e), "\\n"); NULL }))
+    }
+    if (approach == "glmm") {
+      fam <- glmm_family(dat$resp)
+      if (is.null(fam)) { cat("Method: GLMM requested but no safe family for this outcome (continuous with zeros/negatives) — using Gaussian fit instead.\\n")
+        return(tryCatch(if (useRE) lmer(form, data=dat) else lm(form, data=dat), error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL })) }
+      cat("Method: GLMM —", fam$family, "family (link", fam$link, "); contrasts are on the link scale.\\n")
+      m <- tryCatch(if (useRE) glmer(form, data=dat, family=fam) else glm(form, data=dat, family=fam),
+                    error=function(e){ cat("GLMM failed (", conditionMessage(e), ") — falling back to Gaussian.\\n", sep=""); NULL })
+      if (is.null(m)) m <- tryCatch(if (useRE) lmer(form, data=dat) else lm(form, data=dat), error=function(e) NULL)
+      return(m)
+    }
+    if (approach == "robust") {
+      if (useRE && requireNamespace("robustlmm", quietly=TRUE)) {
+        cat("Method: robust LMM (robustlmm::rlmer) — down-weights outliers.\\n")
+        m <- tryCatch(robustlmm::rlmer(form, data=dat), error=function(e){ cat("rlmer failed (", conditionMessage(e), ") — falling back to Gaussian LMM.\\n", sep=""); NULL })
+        if (!is.null(m)) return(m)
+      } else {
+        cat("Method: robust LMM requested, but robustlmm is unavailable", if (!useRE) "and there is no random effect to robustify" else "", "— using the Gaussian fit.\\n")
+      }
+      return(tryCatch(if (useRE) lmer(form, data=dat) else lm(form, data=dat), error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL }))
+    }
+    # default Gaussian
+    if (useRE) tryCatch(lmer(form, data=dat), error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL })
+    else       tryCatch(lm(form, data=dat),   error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL })
   }
   missing_notice <- function(){
     if (missingS %in% c("per_protocol","itt_mice","locf"))
@@ -5477,24 +5584,21 @@ ${covNum}
     useChange   <- (mf %in% c("ancova_change","change_only")) && hasBase && !anovaApp
     useBaseline <- (mf %in% c("ancova_post","ancova_change")) && hasBase && !anovaApp
     tfEff <- tf
-    if (useChange) {
+    if (nonGauss) {
+      dm$resp <- dm$value; tfEff <- "none"          # GLMM family / ranks handle the distribution
+    } else if (useChange) {
       dm$resp <- dm$value - dm$baseline
       if (tf != "none") { cat("(Transform '", tf, "' ignored on a change score.)\\n", sep=""); tfEff <- "none" }
     } else {
       dm$resp <- applyTf(dm$value)
       if (useBaseline && tf != "none") dm$baseline <- applyTf(dm$baseline)
     }
-    respLab <- if (useChange) "value - baseline (change)" else tfLabel()
+    respLab <- if (nonGauss) "value (raw)" else if (useChange) "value - baseline (change)" else tfLabel()
     rhsTerms <- c(if (useBaseline) "baseline", if (multiTime) "grp*time" else "grp", covNames)
     form <- as.formula(paste("resp ~", paste(rhsTerms, collapse=" + "), if (useRE) "+ (1|id)" else ""))
     cat("Model form:", mf, "| approach:", approach, "| transform:", tfEff, "| response:", respLab, "\\n")
-    if (useRE) {
-      cat("Fit: linear mixed model —", deparse(form, width.cutoff=200), "\\n\\n")
-      m <- tryCatch(lmer(form, data=dm), error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL })
-    } else {
-      cat("Fit: baseline-adjusted OLS — single follow-up, random intercept not identifiable; OLS gives the same group contrast (Laird 1983) —", deparse(form, width.cutoff=200), "\\n\\n")
-      m <- tryCatch(lm(form, data=dm), error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL })
-    }
+    cat("Design:", deparse(form, width.cutoff=200), if (useRE) "" else "  (OLS — single follow-up, Laird 1983)", "\\n\\n")
+    m <- fit_engine(form, dm, useRE)
     if (is.null(m)) return(invisible())
     byspec <- if (multiTime) list(f="~ grp | time", lab="at each timepoint") else list(f="~ grp", lab="")
     report_model(m, byspec, respLab, tfEff, label, dm$value)
@@ -5522,16 +5626,16 @@ ${covNum}
     useChange   <- (mf %in% c("ancova_change","change_only")) && hasBase && !anovaApp
     useBaseline <- (mf %in% c("ancova_post","ancova_change")) && hasBase && !anovaApp
     tfEff <- tf
-    if (useChange) { dm$resp <- dm$value - dm$baseline; if (tf != "none") { cat("(Transform ignored on a change score.)\\n"); tfEff <- "none" } }
+    if (nonGauss) { dm$resp <- dm$value; tfEff <- "none" }
+    else if (useChange) { dm$resp <- dm$value - dm$baseline; if (tf != "none") { cat("(Transform ignored on a change score.)\\n"); tfEff <- "none" } }
     else { dm$resp <- applyTf(dm$value); if (useBaseline && tf != "none") dm$baseline <- applyTf(dm$baseline) }
-    respLab <- if (useChange) "value - baseline (change)" else tfLabel()
+    respLab <- if (nonGauss) "value (raw)" else if (useChange) "value - baseline (change)" else tfLabel()
     rhsTerms <- c(if (useBaseline) "baseline", if (multiTime) "grp*time" else "grp", "comp", covNames)
     form <- as.formula(paste("resp ~", paste(rhsTerms, collapse=" + "), if (useRE) "+ (1|id)" else ""))
     cat("Model form:", mf, "| approach:", approach, "| transform:", tfEff, "| nesting: joint (component as factor)\\n")
-    cat("Fit:", if (useRE) "mixed model" else "OLS", "—", deparse(form, width.cutoff=200), "\\n\\n")
-    m <- tryCatch(if (useRE) lmer(form, data=dm) else lm(form, data=dm),
-                  error=function(e){ cat("Joint model failed (", conditionMessage(e), ") — falling back to one model per outcome.\\n", sep=""); NULL })
-    if (is.null(m)) { for (cc in sort(unique(as.character(d$comp)))) fit_one(d[as.character(d$comp) == cc, , drop=FALSE], cc); return(invisible()) }
+    cat("Design:", deparse(form, width.cutoff=200), "\\n\\n")
+    m <- fit_engine(form, dm, useRE)
+    if (is.null(m)) { cat("Joint model could not be fitted — falling back to one model per outcome.\\n"); for (cc in sort(unique(as.character(d$comp)))) fit_one(d[as.character(d$comp) == cc, , drop=FALSE], cc); return(invisible()) }
     byspec <- if (multiTime) list(f="~ grp | comp * time", lab="by component & timepoint") else list(f="~ grp | comp", lab="by component")
     report_model(m, byspec, respLab, tfEff, "JOINT", dm$value)
   }
@@ -5580,7 +5684,8 @@ async function runWithWebR() {
     if (!meta.nRows) { throw new Error("No usable rows after applying your timepoint/outcome selections."); }
     webRLog("Prepared " + meta.nRows + " rows × " + meta.nIds + " participants" + (meta.hasComp ? " × " + meta.components.length + " outcome(s)" : "") + " — all in-browser.");
     const rcode = buildWebRScript(WEBR_CSV_PATH, meta);
-    const text = await WebREngine.runScript(rcode, webRLog, { [WEBR_CSV_PATH]: csv });
+    const extraPkgs = (meta.approach === "robust") ? ["robustlmm"] : [];
+    const text = await WebREngine.runScript(rcode, webRLog, { [WEBR_CSV_PATH]: csv }, extraPkgs);
     webRLog("✓ Done.");
     renderWebRResult(text, meta);
     // Residual-QQ gate (Usman's real assumption): if any outcome's residual Q-Q r < 0.97,
@@ -5634,8 +5739,8 @@ function parseWebRDiag(text) {
 // Map a flagged outcome's data shape to Usman's decision-tree recommendation.
 function recommendFix(d) {
   const t = STATE.outcomeType || "";
-  if (t === "binary") return { kind: "approach", value: "glmm", label: "Logistic GLMM (binary outcome)", real: false };
-  if (t === "count")  return { kind: "approach", value: "glmm", label: "Poisson / Neg-Bin GLMM (count outcome)", real: false };
+  if (t === "binary") return { kind: "approach", value: "glmm", label: "Logistic GLMM (binary outcome)", real: true };
+  if (t === "count")  return { kind: "approach", value: "glmm", label: "Poisson GLMM (count outcome)", real: true };
   const skewed   = isFinite(d.skew) && Math.abs(d.skew) > 0.5;
   const rightSk  = isFinite(d.skew) && d.skew > 0.5;
   const positive = isFinite(d.minval) && d.minval > 0;
@@ -5652,9 +5757,9 @@ const WIZ_OPTIONS = [
   { kind: "transform", value: "log_offset",   text: "log(Y + 1) — right-skewed with zeros", real: true },
   { kind: "transform", value: "sqrt",         text: "√Y — milder; counts or symmetric skew", real: true },
   { kind: "transform", value: "inverse",      text: "1/Y — strong correction (positives only)", real: true },
-  { kind: "approach",  value: "glmm",         text: "GLMM (Gamma / Poisson / Binomial) — needs Step-5 R code", real: false },
-  { kind: "approach",  value: "robust",       text: "Robust LMM (rlmer) — outlier-heavy; needs Step-5 R code", real: false },
-  { kind: "approach",  value: "nonparam",     text: "Non-parametric (rank-based) — needs Step-5 R code", real: false }
+  { kind: "approach",  value: "glmm",         text: "GLMM (Gamma / Poisson / Binomial, by outcome type)", real: true },
+  { kind: "approach",  value: "robust",       text: "Robust LMM (rlmer) — down-weights outliers", real: true },
+  { kind: "approach",  value: "nonparam",     text: "Non-parametric (rank-ANCOVA)", real: true }
 ];
 
 function maybeRenderTransformWizard(diag, meta) {
@@ -5695,9 +5800,12 @@ function maybeRenderTransformWizard(diag, meta) {
   const noteFor = key => {
     const o = WIZ_OPTIONS.find(x => key === x.kind + ":" + x.value);
     if (!o) return "";
-    return o.real
-      ? "✓ The engine will apply this and re-fit in real R, then re-check the residual Q-Q."
-      : "⚠ The in-browser engine fits Gaussian models, so it will record this choice and flag it — for the actual " + o.value.toUpperCase() + " fit, use the Step-5 R code. (A future engine update can run it here.)";
+    if (o.kind === "approach") {
+      if (o.value === "glmm")     return "✓ Re-fits as a real GLMM (family chosen from the outcome type: Gamma/Poisson/Binomial); contrasts are on the link scale.";
+      if (o.value === "robust")   return "✓ Re-fits as a robust LMM (robustlmm::rlmer); installs robustlmm on first use, and falls back to a Gaussian fit if its WASM build isn't available.";
+      if (o.value === "nonparam") return "✓ Re-fits as a rank-ANCOVA (response rank-transformed — Conover); contrasts are on ranks.";
+    }
+    return "✓ The engine applies this and re-fits in real R, then re-checks the residual Q-Q.";
   };
   const noteEl = $("#wiz-fix-note"), selEl = $("#wiz-fix-select");
   const updNote = () => { if (noteEl && selEl) noteEl.textContent = noteFor(selEl.value); };
