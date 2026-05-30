@@ -5409,18 +5409,29 @@ ${covNum}
     if (nrow(dm) < 6 || length(unique(dm$id)) < 3) {
       cat("Too few usable rows for a mixed model on this outcome; skipped.\\n"); return(invisible())
     }
-    hasBase <- any(!is.na(dd$baseline))
-    rhsTerms <- c(if (hasBase) "baseline", if (nlevels(dm$time) >= 2) "grp*time" else "grp", covNames)
-    form <- as.formula(paste("value ~", paste(rhsTerms, collapse=" + "), "+ (1|id)"))
-    cat("Formula:", deparse(form), "\\n\\n")
-    m <- tryCatch(lmer(form, data=dm),
-                  error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL })
+    hasBase   <- any(!is.na(dd$baseline))
+    multiTime <- nlevels(dm$time) >= 2
+    repl      <- if (nrow(dm) > 0) max(table(dm$id)) else 0   # max observations per participant
+    useRE     <- repl >= 2                                    # random intercept only identifiable with within-id replication
+    rhsTerms  <- c(if (hasBase) "baseline", if (multiTime) "grp*time" else "grp", covNames)
+    form <- as.formula(paste("value ~", paste(rhsTerms, collapse=" + "), if (useRE) "+ (1|id)" else ""))
+    if (useRE) {
+      cat("Model: linear mixed model —", deparse(form, width.cutoff=200), "\\n\\n")
+      m <- tryCatch(lmer(form, data=dm),
+                    error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL })
+    } else {
+      cat("Model: baseline-adjusted ANCOVA —", deparse(form, width.cutoff=200), "\\n")
+      cat("(One follow-up per participant for this outcome, so a random intercept is not identifiable;\\n")
+      cat(" OLS gives the same baseline-adjusted group contrast — Laird 1983.)\\n\\n")
+      m <- tryCatch(lm(form, data=dm),
+                    error=function(e){ cat("Model failed:", conditionMessage(e), "\\n"); NULL })
+    }
     if (is.null(m)) return(invisible())
-    cat("--- Fixed effects ---\\n")
+    cat("--- Coefficients ---\\n")
     print(round(summary(m)$coefficients, 4))
     cat("\\n--- ANOVA ---\\n")
     print(tryCatch(anova(m), error=function(e) "anova unavailable"))
-    if (nlevels(dm$time) >= 2) {
+    if (multiTime) {
       cat("\\n--- emmeans: between-group contrast at each timepoint (adjust='none', Usman's lead) ---\\n")
       em <- tryCatch(emmeans(m, ~ grp | time), error=function(e) NULL)
     } else {
