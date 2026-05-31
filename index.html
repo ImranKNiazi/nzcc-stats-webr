@@ -240,6 +240,9 @@
                     border-bottom: 1px solid #f1f5f9; }
   .lf-summary-row:last-child { border-bottom: none; }
   .lf-summary-row .lf-sr-role { color: #475569; }
+  /* v3.0 — Step-3 consistency checker: highlight contradictory / questionable choices */
+  select.q-conflict-error { outline: 2px solid #b91c1c; outline-offset: 1px; background: #fef2f2; }
+  select.q-conflict-warn  { outline: 2px solid #d97706; outline-offset: 1px; background: #fff7ed; }
   .lf-summary-row .lf-sr-col { color: #0f172a; font-weight: 600; font-family: ui-monospace, Menlo, monospace; }
   .lf-summary-row .lf-sr-missing { color: #b91c1c; font-style: italic; }
   .lf-actions { margin-top: 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -4883,11 +4886,107 @@ function updateStructureNote() {
   $("#q-structure-note").textContent = map[$("#q-structure").value] || "";
 }
 
+/* ============================================================================
+   v3.0 — Step-3 consistency checker. Several of the nine choices are mutually
+   constraining (e.g. ANOVA means no baseline, so it can't pair with an ANCOVA
+   model form). Flags hard contradictions (block code-gen) and softer mismatches
+   (warn), and highlights the offending dropdowns.
+   ============================================================================ */
+const STEP3_FIELD_IDS = ["q-structure","q-ref","q-covs","q-nesting","q-adjust","q-model-form","q-approach","q-missing","q-transform"];
+function validateStep3() {
+  const o = STATE.orient || {};
+  const mf = o.modelForm || "ancova_post", ap = o.approach || "ancova", tf = o.transform || "none",
+        nest = o.nesting || "one_per_outcome", miss = o.missing || "complete_case", struct = o.structure || "";
+  const hasComp = !!(STATE.longFormat && STATE.longFormat.componentCol);
+  const adjustsBaseline = (mf === "ancova_post" || mf === "ancova_change");
+  const errors = [], warnings = [];
+
+  // --- Hard contradictions (block "Identify design & generate code") ---
+  if (ap === "anova" && adjustsBaseline)
+    errors.push({ fields: ["q-approach","q-model-form"], msg: `<b>ANOVA</b> means <b>no baseline adjustment</b>, but your model form (<code>${mf}</code>) adjusts for baseline. Either set the approach to <b>ANCOVA/LMM</b>, or set the model form to <b>post-only</b>.` });
+  if (ap === "ancova" && (mf === "post_only" || mf === "change_only"))
+    errors.push({ fields: ["q-approach","q-model-form"], msg: `<b>ANCOVA</b> is baseline-adjusted, but your model form (<code>${mf}</code>) drops the baseline covariate. Use <b>ANCOVA-on-post</b> / <b>change-with-baseline</b>, or switch the approach to <b>ANOVA</b>.` });
+  if (nest === "joint_components" && !hasComp)
+    errors.push({ fields: ["q-nesting"], msg: `<b>Joint model with (Component | PartId)</b> needs a Subscale/Component column, but none is mapped. Map one in Step 2, or choose <i>one model per outcome</i>.` });
+
+  // --- Soft mismatches (warn, non-blocking) ---
+  if (["glmm","nonparam","robust"].includes(ap) && tf !== "none")
+    warnings.push({ fields: ["q-approach","q-transform"], msg: `With a <code>${ap}</code> approach the transform (<code>${tf}</code>) is <b>ignored</b> — the family/ranks handle the distribution. Set transform to <i>none</i> to avoid confusion.` });
+  if ((mf === "change_only" || mf === "ancova_change") && tf !== "none")
+    warnings.push({ fields: ["q-model-form","q-transform"], msg: `A <b>change score</b> can be negative, so the transform (<code>${tf}</code>) will be <b>skipped</b>. Apply transforms only with an ANCOVA-on-post / post-only form.` });
+  if (ap === "lmm" && struct === "two_tp")
+    warnings.push({ fields: ["q-approach","q-structure"], msg: `A <b>linear mixed model</b> needs repeated measures, but this is a <b>two-timepoint</b> design (one follow-up) — it reduces to an ANCOVA. Pick <b>ANCOVA</b>, or set the structure to multi-timepoint if you truly have ≥2 follow-ups.` });
+  if (miss === "itt_lmm" && struct === "two_tp")
+    warnings.push({ fields: ["q-missing","q-structure"], msg: `<b>ITT via LMM (FIML)</b> presumes a mixed model over repeated measures; with one follow-up it behaves as complete-case. Consider complete-case or MICE for a two-timepoint design.` });
+  if (ap === "glmm" && STATE.outcomeType === "continuous")
+    warnings.push({ fields: ["q-approach"], msg: `GLMM on a <b>continuous</b> outcome uses a Gamma(log) family, which needs every value &gt; 0. If the outcome has zeros/negatives the engine falls back to Gaussian — consider a transform instead, or confirm the outcome type in Step 2.` });
+
+  // --- Cross-step checks (Step 2 choices vs Step 3) ---
+  // Step-2 variable type vs Step-3 approach: a non-continuous outcome under a Gaussian model.
+  if (["binary","count","ordinal"].includes(STATE.outcomeType) && !["glmm","nonparam"].includes(ap))
+    warnings.push({ fields: ["q-approach"], msg: `Your outcome is <b>${STATE.outcomeType}</b> (set in Step 2), but the approach (<code>${ap}</code>) fits a <b>Gaussian</b> model. Use <b>GLMM</b> (${STATE.outcomeType==="binary"?"binomial":STATE.outcomeType==="count"?"Poisson":"ordinal"}) or a <b>non-parametric</b> approach for valid inference.` });
+  // Baseline-adjusting model form but no baseline timepoint mapped (long-format).
+  if (adjustsBaseline && STATE.longFormat && STATE.longFormat.timeCol && !STATE.longFormat.baselineLevel)
+    warnings.push({ fields: ["q-model-form"], msg: `Your model form adjusts for <b>baseline</b>, but no baseline timepoint is set in Step 2. Pick the baseline level in the green role panel, or the baseline term will be dropped.` });
+
+  // --- Option A: Step-2 timepoints vs Step-3 structure (Q1) ---
+  // Work out what the DATA implies, then flag if Q1 disagrees.
+  let implied = "";
+  const lf = STATE.longFormat;
+  if (lf && lf.timeCol) {
+    const inc = (lf.includedTimes && lf.includedTimes.length) ? lf.includedTimes : (STATE.colDistinct[lf.timeCol] || []);
+    const hasBase = !!(lf.baselineLevel && inc.indexOf(lf.baselineLevel) !== -1);
+    const followups = inc.length - (hasBase ? 1 : 0);
+    implied = followups >= 2 ? "multi_tp" : "two_tp";
+  } else if (typeof guessStructure === "function") {
+    implied = guessStructure() || "";
+  }
+  if (implied && struct && implied !== struct && ["two_tp","multi_tp"].includes(implied) && ["two_tp","multi_tp"].includes(struct)) {
+    warnings.push({ fields: ["q-structure"], msg: implied === "two_tp"
+      ? `Q1 says <b>multi-timepoint</b>, but after removing baseline your data has <b>one follow-up per participant</b> — the engine will fit a two-timepoint ANCOVA, not a mixed model. Set Q1 to <b>two-timepoint</b>, or include ≥2 follow-up timepoints in Step 2.`
+      : `Q1 says <b>two-timepoint</b>, but Step 2 has <b>≥2 follow-up timepoints</b> — a mixed model is the natural fit. Set Q1 to <b>multi-timepoint</b>, or drop to two timepoints in the Step-2 reshape panel.` });
+  }
+
+  // --- Option B: co-primary outcomes vs multiplicity correction (Q5) ---
+  // Note: secondaries with adjust="none" is NOT flagged — that is Usman's documented default
+  // (report uncorrected, state it in the prose). Only genuine CO-PRIMARIES need a strategy.
+  const roles = STATE.outcomeRoles || {};
+  const nPrimary = Object.keys(roles).filter(k => roles[k] === "primary").length;
+  const adj = o.adjust || "none";
+  if (nPrimary >= 2 && adj === "none")
+    warnings.push({ fields: ["q-adjust"], msg: `You have <b>${nPrimary} co-primary outcomes</b> but no multiplicity strategy (Q5 = none). Co-primary designs usually need a pre-specified approach — alpha-splitting, or a correction (Q5). Confirm this is intended, or pick exactly one primary in Step 2a / Step 7.` });
+
+  return { errors, warnings };
+}
+function renderStep3Validation() {
+  STEP3_FIELD_IDS.forEach(id => { const el = $("#" + id); if (el) el.classList.remove("q-conflict-error","q-conflict-warn"); });
+  const { errors, warnings } = validateStep3();
+  errors.forEach(e => e.fields.forEach(f => { const el = $("#" + f); if (el) el.classList.add("q-conflict-error"); }));
+  warnings.forEach(w => w.fields.forEach(f => { const el = $("#" + f); if (el && !el.classList.contains("q-conflict-error")) el.classList.add("q-conflict-warn"); }));
+  let box = $("#step3-conflicts");
+  if (!box) {
+    const btn = $("#run-btn");
+    if (btn && btn.parentElement) { box = document.createElement("div"); box.id = "step3-conflicts"; box.style.cssText = "margin:10px 0"; btn.parentElement.insertBefore(box, btn); }
+  }
+  if (box) {
+    let html = "";
+    if (errors.length) html += `<div style="background:#fef2f2;border:1.5px solid #b91c1c;border-radius:8px;padding:10px 12px;font-size:13px;color:#7f1d1d;margin-bottom:8px"><b>⚠ ${errors.length} contradictory choice${errors.length>1?"s":""} — fix before generating code:</b><ul style="margin:6px 0 0;padding-left:18px">${errors.map(e=>`<li style="margin:3px 0">${e.msg}</li>`).join("")}</ul></div>`;
+    if (warnings.length) html += `<div style="background:#fff7ed;border:1.5px solid #d97706;border-radius:8px;padding:10px 12px;font-size:13px;color:#7c2d12"><b>${warnings.length} thing${warnings.length>1?"s":""} to double-check:</b><ul style="margin:6px 0 0;padding-left:18px">${warnings.map(w=>`<li style="margin:3px 0">${w.msg}</li>`).join("")}</ul></div>`;
+    box.innerHTML = html;
+  }
+  const btn = $("#run-btn");
+  if (btn) { btn.disabled = errors.length > 0; btn.title = errors.length ? "Resolve the contradictory Step-3 choices first" : ""; }
+  return { errors, warnings };
+}
+
 function setupOrientation() {
   $("#q-structure").addEventListener("change", e => {
     STATE.orient.structure = e.target.value;
     updateStructureNote(); saveState();
   });
+  // Re-validate the nine choices on any change, and once on setup.
+  STEP3_FIELD_IDS.forEach(id => { const el = $("#" + id); if (el) el.addEventListener("change", () => { try { renderStep3Validation(); } catch (e) {} }); });
+  setTimeout(() => { try { renderStep3Validation(); } catch (e) {} }, 0);
   $("#q-ref").addEventListener("change", e => { STATE.orient.refLevel = e.target.value; saveState(); });
   $("#q-covs").addEventListener("change", e => {
     STATE.orient.covariates = Array.from(e.target.selectedOptions).map(o => o.value).filter(v => v);
@@ -5069,6 +5168,7 @@ function applyUsmanDefaults() {
   bar.querySelector("button").style.display = "none";
 
   saveState();
+  try { renderStep3Validation(); } catch (e) {}
 }
 
 /* ============================================================================
@@ -5103,6 +5203,13 @@ function labelForStructure(s) {
 
 function runVerdict() {
   if (!STATE.orient.structure) { alert("Pick a data structure first."); return; }
+  // Block on hard contradictions among the nine Step-3 choices.
+  const v = renderStep3Validation();
+  if (v && v.errors && v.errors.length) {
+    const box = $("#step3-conflicts");
+    if (box) box.scrollIntoView({ behavior: "smooth", block: "center" });
+    return;
+  }
   const o = STATE.orient;
   STATE.verdict = { ...o, n: o.n || (STATE.colDistinct[colByRole("ID")]?.length || null),
                     timestamp: new Date().toISOString(), fileName: STATE.fileName };
